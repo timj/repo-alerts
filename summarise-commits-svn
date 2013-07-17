@@ -1,0 +1,715 @@
+#!perl -w
+
+=head1 NAME
+
+summarise-commits-svn - Summarise commits in a subversion repository
+
+=head1 SYNOPSIS
+
+  summarise-commits-svn -startrev NNNN -repos starlink
+
+=head1 DESCRIPTION
+
+Create an HTML page of changes made to a repository since the last
+time this program was run (or from the supplied revision number).
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-help>
+
+Print help information.
+
+=item B<-version>
+
+Print version information.
+
+=item B<-man>
+
+Print the full documentation to STDOUT.
+
+=item B<-startrev>
+
+Start from this revision. Otherwise starts from one above the most recent
+revision that was extracted last time this command was run.
+
+=item B<-repos>
+
+The name of the repository to process. This value corresponds to special settings
+that are indexed by repository name. Default is "starlink".
+
+=item B<-noemail>
+
+Disable the mailing of report summary. Mail message is not sent if no revisions
+have been committed since the last time this ran.
+
+=item B<-stdout>
+
+Send HTML to standard output rather than to the default file.
+
+=back
+
+=cut
+
+use warnings;
+use strict;
+use File::Spec;
+use Pod::Usage;
+use Getopt::Long;
+use Net::SMTP;
+$| = 1; # unbuffered
+
+# Restrict PATH
+$ENV{PATH} = "/usr/bin:/opt/local/bin";
+
+# Mail SMTP server
+my $MAILHOST = "mailhost";
+
+# Repository root path without the last directory included (which in JAC
+# case is the directory that contains all subversion repositories)
+my $REPO_ROOT = "/jac_sw/svnroot";
+
+# Base Prefix to strip from reports (usually does not vary for reports
+# and will be augmented if an additional filter has been applied)
+my $IGNORE_PREFIX = "trunk/";
+
+# We could read these from a config file if this is to become a general
+# program for subversion use but for now use a hash
+
+my %SETTINGS = (
+		scicom => {
+			   # Base URL for viewvc links
+			   viewvchome => "http://cvsweb.jach.hawaii.edu/viewvc/",
+			   # Directory name of the subversion tree relative to root path
+			   svnroot => "scicom",
+			   # URL root dir where report web page will appear
+			   reporturlroot => "http://www.jach.hawaii.edu/software",
+			   # Where mail message will be sent
+			   reportmail => 'scicom@jach.hawaii.edu',
+			   # Local directory on the web server for web page and .revision file
+			   reportdir => '/web/html/software',
+			   # Name of report web file
+			   reportfile => 'summarize-commits.html',
+			   # Filter used to restrict report to specific part of repository tree
+			   file_filter => '',
+			   # indicates that the viewvc has root requirement
+			   hasviewvcroot => 1,
+			  },
+		oracdr => {
+			   # Base URL for viewvc links
+			   viewvchome => "http://www.oracdr.org/viewvc/",
+			   # Directory name of the subversion tree relative to root path
+			   svnroot => "oracdr",
+			   # URL root dir where report web page will appear
+			   reporturlroot => "http://www.oracdr.org",
+			   # Where mail message will be sent
+			   reportmail => 'oracdr@jach.hawaii.edu',
+			   # Local directory on the web server for web page and .revision file
+			   reportdir => '/web/oracdr.org',
+			   # Name of report web file
+			   reportfile => 'summarize-commits.html',
+			   # Filter used to restrict report to specific part of repository tree
+			   file_filter => '',
+			   # indicates that the viewvc has root requirement
+			   hasviewvcroot => 0,
+			  },
+		starlink => {
+			   # Base URL for viewvc links
+			   viewvchome => "http://starlink.jach.hawaii.edu/viewvc/",
+			   # Directory name of the subversion tree relative to root path
+			   svnroot => "starlink",
+			   # URL root dir where report web page will appear
+			   reporturlroot => "http://starlink.jach.hawaii.edu/",
+			   # Where mail message will be sent
+			   reportmail => 'stardev@jiscmail.ac.uk',
+			   # Local directory on the web server for web page and .revision file
+			   reportdir => '/web/starlink',
+			   # Name of report web file
+			   reportfile => 'summarize-commits.html',
+			   # Filter used to restrict report to specific part of repository tree
+			   file_filter => '',
+			   # indicates that the viewvc has root requirement
+			   hasviewvcroot => 0,
+			  },
+		starjava => {
+			   # Base URL for viewvc links
+			   viewvchome => "http://starjava.jach.hawaii.edu/viewvc/",
+			   # Directory name of the subversion tree relative to root path
+			   svnroot => "starjava",
+			   # URL root dir where report web page will appear
+			   reporturlroot => "http://starlink.jach.hawaii.edu/",
+			   # Where mail message will be sent
+			   reportmail => 'stardev@jiscmail.ac.uk',
+			   # Local directory on the web server for web page and .revision file
+			   reportdir => '/web/starlink',
+			   # Name of report web file
+			   reportfile => 'summarize-commits-starjava.html',
+			   # Filter used to restrict report to specific part of repository tree
+			   file_filter => '',
+			   # indicates that the viewvc has root requirement
+			   hasviewvcroot => 0,
+			  },
+		smurf => {
+			   # Base URL for viewvc links
+			   viewvchome => "http://starlink.jach.hawaii.edu/viewvc/",
+			   # Directory name of the subversion tree relative to root path
+			   svnroot => "starlink",
+			   # URL root dir where report web page will appear
+			   reporturlroot => "http://starlink.jach.hawaii.edu/",
+			   # Where mail message will be sent
+			   reportmail => 'scuba2dr_dev@phas.ubc.ca',
+			   # Local directory on the web server for web page and .revision file
+			   reportdir => '/web/starlink',
+			   # Name of report web file
+			   reportfile => 'summarize-commits-smurf.html',
+			   # Filter used to restrict report to specific part of repository tree
+			   file_filter => 'applications/smurf',
+			   # indicates that the viewvc has root requirement
+			   hasviewvcroot => 0,
+			  },
+);
+
+# Argument parsing
+my ($help, $man, $version, $startrev, $repos, $stdout);
+my $email = 1; # default to sending email
+my $ostatus = GetOptions( "help" => \$help,
+                          "man" => \$man,
+                          "version" => \$version,
+			  "startrev=s" => \$startrev,
+			  "repos=s" => \$repos,
+			  "email!" => \$email,
+			  "stdout" => \$stdout,
+                         );
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose =>2) if $man;
+if ($version) {
+    my $id = '$Id: summarise-commits 24861 2007-07-10 02:29:06Z timj $';
+    print "summarize-commits: Provide summary of recent commits to subversion\n";
+    print " Revision: $id\n";
+    exit;
+}
+
+# Validate revision
+if ($startrev) {
+  if ($startrev !~ /^(\d+)$/) {
+    die "Supplied revision ($startrev) does not look like an integer\n";
+  } else {
+    # untaint
+    $startrev = $1;
+  }
+}
+
+# Select the correct set of configuration parameters
+if ($repos) {
+  die "Specified repository ($repos) is not understood\n"
+    if !exists $SETTINGS{$repos};
+  # now untaint $repos
+  for my $k (keys %SETTINGS) {
+    if ($k eq $repos) {
+      $repos = $k;
+      last;
+    }
+  }
+} else {
+  $repos = 'starlink';
+}
+my %CFG = %{$SETTINGS{$repos}};
+
+# These are the derived values from those parameters
+
+# location of repository
+my $reposdir = File::Spec->catdir($REPO_ROOT, $CFG{svnroot});
+die "Unable to find the repository directory ($reposdir)\n"
+  if !-d $reposdir;
+
+# Name of file containing the revision that was processed last time
+# this ran
+my $revfile = ".revision-$CFG{svnroot}";
+
+# if we have a filter in place, append the last part of the path to the revfile
+if ($CFG{file_filter}) {
+  my @dirs = File::Spec->splitdir( $CFG{file_filter} );
+  $revfile .= "-$dirs[-1]";
+}
+
+# Calculate the path to the revision file (we will need it later)
+my $revfilepath = File::Spec->catfile($CFG{reportdir}, $revfile);
+
+# report URL 
+my $reporturl = $CFG{reporturlroot} ."/$CFG{reportfile}";
+
+# now we can start
+
+# Get the youngest revision
+my $endrev = youngest_rev();
+
+# Work out a starting revision
+my $baserev;
+if ($startrev) {
+  # we have an override
+  $baserev = $startrev;
+  die "Largest revision number in repository is $endrev (you supplied $baserev)\n"
+    if ($baserev > $endrev); 
+} elsif (-e $revfilepath) {
+  open(my $fh, "< $revfilepath") or
+    die "Error opening revision history file '$revfilepath' : $!";
+  $baserev = <$fh>;
+  chomp($baserev);
+  $baserev++; # since we want to start from the next one
+  close($fh) or die "Error closing file '$revfilepath': $!";
+} else {
+  die "Do not know which revision to use as reference! Consider using -startrev\n";
+}
+
+if ($endrev - $baserev > 100) {
+  die "Unexpectedly large number of revisions to process ($baserev to $endrev)\n";
+}
+
+my %INFO;   # revision info
+my %ALLFILES; # look up of file to revision
+
+# need to find out date range even if we are not interested in all revisions
+my ($earliest, $latest);
+{
+  if ($baserev <= $endrev) {
+    my %info = get_info( $baserev );
+    $earliest = $info{date};
+    %info = get_info( $endrev );
+    $latest = $info{date};
+  }
+}
+
+# loop over each revision, getting information;
+for my $rev ($baserev .. $endrev) {
+  my @files = changed_files( $rev );
+
+  # if we have a file filter we should jump in at this point to only include
+  # revisions that are relevant. If any file matches then we include the
+  # whole revision since the assumption is that non-matching files in this
+  # revision are still relevant
+  my $keeprev = 1;
+  if ($CFG{file_filter}) {
+    my $pattern = quotemeta($CFG{file_filter});
+    my $found = 0;
+    for my $f (@files) {
+      if ($f =~ /$pattern/) {
+	$found = 1;
+	last;
+      }
+    }
+    $keeprev = 0 unless $found;
+  }
+  next unless $keeprev;
+
+
+  # Store general info
+  my %info = get_info( $rev );
+  $info{files} = \@files;
+  $INFO{$rev} = \%info;
+
+  # store reverse lookup
+  for my $f (@files) {
+    if (exists $ALLFILES{$f}) {
+      push(@{$ALLFILES{$f}}, $rev);
+    } else {
+      $ALLFILES{$f} = [ $rev ];
+    }
+  }
+}
+
+# Group files by hierarchy
+my @SORTED = sort sort_log_entry keys %ALLFILES;
+
+# HTML page
+my $HTML;
+if ($stdout) {
+  # write to standard output instead
+  $HTML = *STDOUT;
+} else {
+  my $htmlfile = File::Spec->catfile($CFG{reportdir}, $CFG{reportfile});
+  open($HTML, "> $htmlfile") or die "Error opening HTML output $htmlfile: $!";
+}
+
+print $HTML <DATA>;
+print $HTML "<body>\n";
+if (keys %INFO) {
+  print $HTML "<h1>Commits between $earliest to $latest (Rev $baserev to $endrev)</h1>\n";
+} else {
+  print $HTML "<h1>Commit log (since Revision ".&revhtml($baserev -1 ).")</h1>\n";
+}
+
+if (keys %INFO) {
+  
+  # Start off with the revision messages
+  for my $rev (reverse sort { $a <=> $b } keys %INFO) {
+    printf($HTML
+	   "<div class='onerevision'>\n<p>".
+	   &revhtml($rev) .
+	   ", %s</p>\n<pre>\n%s</pre>\n</div>", 
+	   $INFO{$rev}{author}, escape_html($INFO{$rev}{log}));
+  }
+
+}
+
+if (keys %ALLFILES) {
+
+      # Modified files
+      print $HTML "<table>\n<tr><th>File</th><th>author</th></tr>\n";
+
+      # go through the files
+      my $lastprefix = '';
+      my $i=0;
+      for my $file (@SORTED) {
+	my $filtered = $file;
+	$filtered =~ s/^$IGNORE_PREFIX//;
+	my $this_prefix = sort_string( $file );
+	if ($this_prefix ne $lastprefix) {
+	  printf $HTML "<tr class='entry'><td colspan='2'>%s</td></tr>\n",
+	    $this_prefix;
+	  $lastprefix = $this_prefix;
+	}
+
+	my %authors;
+	for my $rev (@{$ALLFILES{$file}}) {
+	  my $a = $INFO{$rev}{author};
+	  $authors{$a}++;
+	}
+	printf $HTML "<tr class='r%d'><td><a href='#c%d' >%s</a></td>".
+	  "<td>%s</td></tr>\n",
+	    $i %2, $i++, $filtered, join(",",sort keys %authors);
+
+      }
+
+      print $HTML "</table>\n";
+
+      # Now create the detailed log - sorted by file
+      $i = 0;
+      for my $file (@SORTED) {
+	my $filtered = $file;
+	$filtered =~ s/^$IGNORE_PREFIX//;
+
+	printf($HTML "<h2><a name='c%d' href='%s/%s?%s"."view=log'\n >%s</a></h2>\n",
+	       $i++, $CFG{viewvchome}, $file, ($CFG{hasviewvcroot}? "root=$CFG{svnroot}&":""), $filtered);
+
+	my $latest_rev = $ALLFILES{$file}->[-1];
+	print $HTML "<P>Most recent revision: ".&revhtml($latest_rev)."</p>\n";
+	  
+	print $HTML "<h3>History</h3>\n";
+	  
+	for my $rev (reverse @{$ALLFILES{$file}}) {
+	  printf($HTML
+		 "<div class='onerevision'>\n<p>".
+		 &revhtml($rev) .
+		 ", %s (%s)</p>\n<pre>\n%s</pre>\n</div>", 
+		 $INFO{$rev}{author},
+		 $INFO{$rev}{date}, escape_html($INFO{$rev}{log}));
+	}
+
+      }
+
+} else {
+  print $HTML "<P>No commits in this period.</p>\n";
+}
+
+print $HTML "</body></html>\n";
+close($HTML) unless $stdout;
+
+# Construct the email (which just has changed files in it)
+# Do nothing if nothing has been committed
+if ($email && keys %ALLFILES && $CFG{reportmail}) {
+  my @email;
+  push(@email,"\nRepository commits in period $earliest to $latest (revision ".
+       "$baserev to revision $endrev)\n\n");
+  push(@email, "See $reporturl for more details\n\n");
+  push(@email, "Revisions:\n\n");
+  for my $rev (reverse sort { $a <=> $b } keys %INFO) {
+    push(@email, "\t$rev (".$INFO{$rev}{author}."):\n");
+    my @lines = split ("\n", $INFO{$rev}{log});
+    for my $l (@lines) {
+      push(@email, "\t  $l\n");
+    }
+  }
+  push(@email, "\n");
+  push(@email, "Committed files\n\n");
+
+  for my $file (@SORTED) {
+    my $filtered = $file;
+    $filtered =~ s/^$IGNORE_PREFIX//;
+    push(@email, "\t$filtered\n");
+  }
+  sendmail({
+	    from => $ENV{USER} .'@jach.hawaii.edu',
+	    to => $CFG{reportmail},
+	    subject => "Recent repository commits",
+	    mailhost => $MAILHOST,
+	    message => \@email});
+
+}
+
+
+# Done, so write the new marker file
+if (open my $revhdl, ">", $revfilepath) {
+  print $revhdl $endrev ."\n";
+  close($revhdl);
+} else {
+  warn "Could not write marker file for revision $endrev into $revfilepath\n";
+}
+
+exit;
+
+# wrappers to svnlook (ooh - global variables)
+
+sub youngest_rev {
+  my $young = `svnlook youngest $reposdir`;
+  chomp($young);
+  if ($young =~ /^(\d+)$/) {
+    $young = $1; # untaint
+  } else {
+    die "unexpected value returned from snvlook youngest: $young\n";
+  }
+  return $young;
+}
+
+# Get list of files that have been modified
+# Arg is revision number
+sub changed_files {
+  my $rev = shift;
+  my @lines = `svnlook changed -r $rev $reposdir`;
+  my @files;
+  for my $l (@lines) {
+    chomp($l);
+    my ($change, $file) = split(/\s+/, $l);
+    push(@files, $file);
+  }
+  return @files;
+}
+
+# Get the basic info for the revision
+# %info = get_info( $rev );
+# keys are: "author", "log", "date"
+
+sub get_info {
+  my $rev = shift;
+  my %info;
+  my @lines = `svnlook info -r $rev $reposdir`;
+  chomp(@lines);
+  $info{author} = $lines[0];
+  $info{date} = $lines[1];
+  $info{log} = join("\n",@lines[3..$#lines]);
+  return %info;
+}
+
+# send the email
+sub sendmail {
+    my $param = shift;
+
+    unless ($param->{to}
+            && $param->{from}
+            && $param->{subject}
+            && $param->{mailhost}
+            && $param->{message}) {
+        return 0;
+    }
+
+    my $smtp = Net::SMTP->new($param->{mailhost});
+    defined $smtp || do {
+        print STDERR "Can't open SMTP connection to ".$param->{mailhost}."\n";
+        return 0;
+    };
+
+    my $status = 1;
+    
+    $status &= $smtp->mail($param->{from});
+    $status || print "Error mail\n";
+    $status &= $smtp->recipient($param->{to});
+    $status || print "Error recipient\n";
+    $status &= $smtp->data();
+    $status || print "Error data\n";
+    $status &= $smtp->datasend("To: ".$param->{to}."\n");
+    $status &= $smtp->datasend("From: ".$param->{from}."\n");
+    $status &= $smtp->datasend("Subject: ".$param->{subject}."\n");
+    $status &= $smtp->datasend("Date: ".localtime()."\n");
+    $status &= $smtp->datasend("\n");
+    foreach my $line (@{$param->{message}}) {
+        chomp($line);
+        $status &= $smtp->datasend($line . "\n");
+    }
+    $status &= $smtp->dataend;
+    $status &= $smtp->quit;
+    $status || print "Error quit\n";
+
+    return $status;
+}
+
+# Embedded HTML pointing to a particular revision
+
+sub revhtml {
+  my $rev = shift;
+  return sprintf "<a href='%s?view=rev&%s"."revision=%d'>%d</a>",
+    $CFG{viewvchome}, ($CFG{hasviewvcroot} ? "root=$CFG{svnroot}&" : ""), $rev, $rev;
+}
+
+# A string indicating the component this is part of, for sorting
+# purposes.  This is basically just the first two elements of the path,
+# but it's TOP for the top level, and the first three elements for
+# thirdparty/ (yes, SPECIAL-CASE this).
+sub sort_string {
+  my $path = shift;
+  my $sort_string;
+  if (defined $path) {
+    $path =~ s/^$IGNORE_PREFIX//;
+    my @s = File::Spec->splitdir( $path );
+    my $prefixlen;
+    if ($#s == 0) {
+      $prefixlen = 0;
+    } elsif ($#s == 1) {
+      $prefixlen = 1;
+    } elsif ($s[0] eq "thirdparty") {
+      $prefixlen = 3;
+    } else {
+      $prefixlen = 2;
+    }
+    $sort_string = ($prefixlen == 0
+		    ? "TOP"
+		    : join('/',@s[0..$prefixlen-1]));
+  }
+  return $sort_string;
+}
+
+sub sort_log_entry {
+  # Sort on sort_string() first -- this groups related entries
+  # together.  If two have the same sort_string(), then sort on
+  # the filename -- sorts entries within groups.
+  # branches and tags should always come down the bottom
+
+  # Get local copies for local modification
+  my $acmp = $a; my $bcmp = $b;
+
+  # see if we have branches or tags
+  my $abranch = ($acmp =~ /^branches\//);
+  my $bbranch = ($bcmp =~ /^branches\//);
+  my $atag    = ($acmp =~ /^tags\//); # yes, only needed if !$abranch
+  my $btag    = ($bcmp =~ /^tags\//);
+
+  if ($abranch && $bbranch) {
+    # normal comparison within like tree
+    $acmp =~ s/^branches\///;
+    $bcmp =~ s/^branches\///;
+  } elsif ($atag && $btag) {
+    # normal comparison within tag tree
+    $acmp =~ s/^tags\///;
+    $bcmp =~ s/^tags\///;
+  } elsif ($abranch) {
+    # this is a branch but the other is not
+    # return -1 or +1 depending on whether b is a tag or trunk
+    return ($btag ? -1 : +1 );
+  } elsif ($bbranch) {
+    # B is a branch but A is not
+    return ($atag ? +1 : -1 );
+  } elsif ($atag) {
+    # a is a tag but b is either trunk or branch (which both sort higher)
+    return 1;
+  } elsif ($btag) {
+    # b is a tag but a is higher
+    return -1;
+  }
+
+  # continue with sort because we are all part of the same tree
+  my $s = sort_string($acmp) cmp sort_string($bcmp);
+  if ($s == 0) {
+    return $acmp cmp $bcmp;
+  } else {
+    return $s;
+  }
+}
+
+# Given a string, do HTML escapes of <, >, and &
+sub escape_html {
+    my $s = shift;
+    $s =~ s/&/&amp;/g;
+    $s =~ s/</&lt;/g;
+    $s =~ s/>/&gt;/g;
+    return $s;
+}
+
+=head1 AUTHOR
+
+Tim Jenness E<lt>t.jenness@jach.hawaii.eduE<gt>,
+Norman Gray E<lt>norman@ASTRO.GLA.AC.UKE<gt>
+
+Copyright (C) 2005 Particle Physcis and Astronomy Research Council.
+Copyright (C) 2007 Science and Technology Facilities Council.
+All Rights Reserved.
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 2 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful,but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, write to the Free Software Foundation, Inc., 59 Temple
+Place,Suite 330, Boston, MA  02111-1307, USA
+
+=cut
+
+__DATA__
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html>
+<head>
+<title>Recent CVS commits</title>
+<!-- <link type="text/css" rel="stylesheet" href="style.css"/> -->
+<!-- Following inline stylesheet would be a lot better in an external .css
+     file (not least because it confuses Emacs syntax highlighting
+     something rotten). -->
+<style type="text/css">
+
+body {
+  color: #003;
+  background: white;
+  margin-left: 10%;
+  margin-right: 10%;
+  font-family: optima, arial, helvetica, sens-serif;
+}
+
+/* Link colours should be specified, since text colour was in body spec */
+a:link    { color: #009; }
+a:active: { color: #00C; }
+a:visited { color: #600; }
+a[href]:hover { background: #FF9; }     /* CSS2 */
+
+h1 {
+  margin-left: -10%;
+  margin-right: -10%;
+  padding: 0.5em;
+  background: navy;
+  color: white;
+}
+h2 {
+  margin-left: -5%;
+  border-top: thick solid red;
+}
+
+pre {
+  background: silver;
+}
+
+th {
+  text-align: left;
+}
+tr.r0 {
+  background: #DDF;
+}
+tr.r1 {
+  background: #BBF;
+}
+tr.entry {
+  background: #99F;
+  line-height: 2.0;
+}
+</style>
+</head>
